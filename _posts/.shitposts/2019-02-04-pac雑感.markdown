@@ -1,0 +1,86 @@
+---
+layout: "post"
+title: "PAC雑感"
+date: "2019-02-04 15:25"
+---
+
+ARMv8.3から導入されたPAC(Pointer Authentication Code)に対する雑な感想を適当に書く
+
+### PACの雑な説明
+iOSにもiPhoneXS以降のアーキテクチャ、A12以降のデバイスに乗るようになってる、A12以降はARMv8‑A-Compatibleなので。PACの目的は、ROP、JOP、COPのようなcode reusing attackを潰し、CFI(Control Flow Integrity)を強制するということがiOS内では主に置かれている感。
+64bitのARMアーキテクチャの仮想アドレスのポインタの構造がこんな感じ
+![pointer-structure]({{ site.url }}/images/2019/02/pointer-structure.png)
+
+見てわかる通り、54-VA_SIZEと63-56ビットの領域が空いていて追加の情報を入れられる状態になってて、64bitのアドレス空間といいつつもほとんどのシステムはVA_SIZEが32~52程度で55bit目がアドレス空間のhighかlowか(一般的にユーザー空間かカーネル空間か)を示していて、残りのビットたちを他の情報が残せるようになってる。
+もしtagged address機能が有効なシステム上だったら63~56の8bitがそのまま使われたまま残りのスペースにPACが置かれて、有効じゃなければそのスペースもPACが使うことができる(より多くのbit数を使った方がブルートフォースによる攻撃を防ぎ易いため)
+
+暗号化方式としてはQARMAというアルゴリズムが使われていてこんな感じのアルゴリズム
+![qarma-algorithm](/images/2019/02/qarma-algorithm.png)
+
+
+
+例えば、PACをContextとして用いてる例として、Cの関数コールでは一般的であるpushとpopをPACIBSPとRETABを用いることで一般的なROPの攻撃手法であるスタックにリターンアドレスを積むことで行うROP系の攻撃を防ぐことができる
+
+![PAC-inst-diagram](/images/2019/02/pac-inst-diagram.png)
+![aut-inst-diagram](/images/2019/02/aut-inst-diagram.png)
+
+このダイアグラムの通り、PACIBSPはContextとしてスタックアドレスを、AddressにはLR(X30)レジスタにある値を、KeyはBを使用し、RETABはAUT+pop+brを一つの命令にまとめた形で AddressにPointer+PAC、ContextにはPACIBSPと同じスタックアドレスを、Keyは同じくBを使用して、その結果生成されたPACがAddressに入れたPointer+PACと等しいか否かで整合性の取れたポインタか不正だった場合はTranslation faultが生成される。
+
+#### Backward-edge CFI implementation
+
+```
+PACIBSP
+STP X29, X30, [SP, #-0x10+var_s0]!
+
+~~~~
+
+LDP X29, X30, [SP+var_s0], #0x10
+RETAB
+```
+
+RETABでリターン先となるリターンアドレス(X30)にはスタックアドレスに紐付けされたsignatureが使われるため、もしgadgetとして使いたい場合はスタックアドレスが既知である必要があるためその時に呼ばれているスタックフレームのポインタのリークが必要なので多少難しくなる
+
+#### Forward-edge CFI implementation
+
+![forwardedgecfi-implement](/images/2019/02/forwardedgecfi-implement.png)
+(FFFFFFF007F6CB40)
+
+一行目でPAC挿入済みのvtableのポインタをX8に代入し、
+二行目でContextなしでAキーを使ってX8をPACなしのポインタにし、
+三、四行目でvtableから0x110番目の関数ポインタ(PAC挿入済み)をX8に代入し、X9にはそのポインタをさすポインタを代入しこれをBLRAAでContextとして使う、
+五行目でX9の64:48のビットにこのvirtual call特有のバイト列0x8453を仕込み、七行目でAキーを用いてX9の値をContextとして用いてPACを外したX8のアドレスにジャンプする
+
+これによって防げることはvtable内のポインタを書き換えて行うことで自分の[任意のアドレスジャンプできるテクニック](https://www.syssec.ruhr-uni-bochum.de/media/emma/veroeffentlichungen/2015/03/28/COOP-Oakland15.pdf)を大幅に防ぐことができる。理由は下記。
+- vtableに入っている関数ポインタたち全てがPAC挿入済みの状態になっている
+- その関数ポインタを呼び出すためにはContextとなる情報にその関数を指しているポインタと64:48のビットに入るspecificな値を知っている必要がある
+- 仮にvtableに入っている関数ポインタを書き換えたとしてもCounterfeit Object-oriented Programmingで使用されているようなvtableにある関数ポインタをそのまま自分の任意のアドレスに書き換えるようなことができなくなる(BLRAAの部分でTranslation faultが発生するため)
+
+回避方法として考えうるのは、vtableに書いてあるポインタを書き換えた上でBLRAAでジャンプする際のContextとしてX9が使われる時に、そのX9が自前で作ったPAC済みのvtableにある関数ポインタと対応していた場合のみ成功する(64:48にspecificな値が入るのでまずこの方法ではありえない)。
+
+### 面白い点
+  - 現状のiOSはEL2とEL3で動いてない、EL3は一応KTRRとかで使われてるけどPACでは使われてない、これが意味するのはEL1でEL1同士のPACを管理してるということ
+  - スリープ状態になった時には、システムレジスタたちをカーネル空間のメモリ上に移動しなければいけないからカーネル上のどこかにはキーが存在するということ
+  - Appleはユーザー空間でもカーネル空間でも同じPACキーを使ってる、PACIAのアルゴリズムにデカい違いがないので
+    - これは本当だったらクソやばくて、ユーザー空間にあるPACキーを改変してユーザー空間のPACIAをカーネル空間のアドレスにも実行できるからAppleが使ってる改変QARMAのアルゴリズムを使わなくても突破できちゃうってやつ(Cross-EL PAC forgeries)
+  - PACIA, PACIB, PACDA, PACDBは本質的には同じ実装でただそれぞれ違うPACキーを持ってるだけ
+    - ということは一個のPACキーを一つ違うものに変えれれば、新しいsigning gadgetをもう一個のアルゴリズム用に作れる(Cross-key PAC forgeries)
+    - ここで定義するSigning gadgetは、ある命令列、任意のポインターを攻撃者側がsign(PACを作れる)ことができるもの
+
+
+## 注意点
+AppleはQualcommが発表したQARMAのアルゴリズムから少し改変してPACを生成している。
+
+
+
+
+
+
+#### References
+- https://googleprojectzero.blogspot.com/2019/02/examining-pointer-authentication-on.html
+- https://www.qualcomm.com/media/documents/files/whitepaper-pointer-authentication-on-armv8-3.pdf
+- https://events.static.linuxfound.org/sites/events/files/slides/slides_23.pdf
+- https://lwn.net/Articles/718888/
+- https://static.docs.arm.com/ddi0596/a/DDI_0596_ARM_a64_instruction_set_architecture.pdf
+- https://developer.apple.com/documentation/security/preparing_your_app_to_work_with_pointer_authentication
+- https://share.weiyun.com/5IJZPBp
+- https://www.syssec.ruhr-uni-bochum.de/media/emma/veroeffentlichungen/2015/03/28/COOP-Oakland15.pdf)
