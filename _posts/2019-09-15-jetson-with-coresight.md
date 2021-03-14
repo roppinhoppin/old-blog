@@ -1,6 +1,6 @@
 ---
 layout: post
-title: "Using Jetson TX2 with CoreSight"
+title: "Jetson TX2とCoreSight"
 ---
 
 
